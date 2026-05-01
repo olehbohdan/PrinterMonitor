@@ -1,0 +1,15 @@
+# Helpers for PrinterMonitor.
+# Put under /config/input_booleans/printer_monitor.yaml and /config/input_selects/printer_monitor.yaml
+# (split as needed) - or merge inline under input_boolean: / input_select: in configuration.yaml
+
+input_boolean:
+  printer_monitor_shaper_capture_active:
+    name: PrinterMonitor Shaper Capture Active
+    icon: mdi:waveform
+
+input_select:
+  printer_monitor_shaper_axis:
+    name: PrinterMonitor Shaper Axis
+    options: [X, Y]
+    initial: X
+    icon: mdi:axis-arrow

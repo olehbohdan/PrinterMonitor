@@ -1,0 +1,113 @@
+# Automations for PrinterMonitor.
+# Append to /config/automations.yaml (or include this file as a separate
+# automation file).
+#
+# These automations bridge ESPHome <-> Klipper/Moonraker and run the
+# off-device shaper search.
+
+- id: printer_monitor_forward_sweep_request
+  alias: "Printer Monitor: forward sweep request to Moonraker"
+  description: >-
+    When the ESP32-C3 fires esphome.printer_monitor_request_sweep,
+    invoke the matching Klipper macro on the selected printer.
+  mode: single
+  trigger:
+    - platform: event
+      event_type: esphome.printer_monitor_request_sweep
+  action:
+    - service: rest_command.moonraker_run_macro
+      data:
+        macro: "PM_SHAPER_SWEEP_{{ trigger.event.data.axis | upper }}"
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.printer_monitor_shaper_capture_active
+
+- id: printer_monitor_process_psd
+  alias: "Printer Monitor: process PSD when capture completes"
+  description: >-
+    Save PSD JSON to /tmp/pm_psd.json and run the off-device shaper search.
+  mode: queued
+  trigger:
+    - platform: event
+      event_type: esphome.printer_monitor_psd_ready
+  action:
+    # Persist payload to disk so the python script can read it
+    - service: notify.persistent_notification
+      data:
+        title: "PrinterMonitor PSD ready"
+        message: >-
+          axis={{ trigger.event.data.axis }} fs={{ trigger.event.data.fs }}
+          peak={{ trigger.event.data.peak_hz }} Hz
+    # Surface the on-device peak in the Klipper console immediately, so the
+    # user sees something before the off-device shaper search finishes.
+    - service: rest_command.moonraker_run_macro
+      data:
+        macro: >-
+          M118 PM_PEAK AXIS={{ trigger.event.data.axis }}
+          PEAK={{ '%.1f' | format(trigger.event.data.peak_hz | float) }}Hz
+    # Write the JSON file. We use the file-system shell trick because HA
+    # automations don't have a native "write file" action without
+    # community add-ons.  The PSD is small (<2 KB) so this is fine.
+    - service: shell_command.pm_write_psd
+      data:
+        json_path: "/tmp/pm_psd.json"
+        payload: >-
+          {{ {'axis': trigger.event.data.axis,
+              'fs':   trigger.event.data.fs | float,
+              'peak_hz': trigger.event.data.peak_hz | float,
+              'psd':  trigger.event.data.psd } | to_json }}
+    - service: shell_command.pm_apply_shaper
+      data:
+        json_path: "/tmp/pm_psd.json"
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.printer_monitor_shaper_capture_active
+
+- id: printer_monitor_acoustic_anomaly
+  alias: "Printer Monitor: notify on acoustic anomaly during print"
+  description: >-
+    If acoustic z-score is high while a printer is actively printing,
+    notify the user. Optionally also pause the print.
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.printer_monitor_acoustic_anomaly_score
+      above: 4.0
+      for: "00:00:10"
+  condition:
+    # Only when at least one printer is in 'printing'-like state. Edit
+    # the entity_ids to match your setup.
+    - condition: template
+      value_template: >-
+        {% set s_a = states('sensor.klipperpi_print_state') | lower %}
+        {% set s_b = states('sensor.a1_print_state') | lower %}
+        {{ 'print' in s_a or 'run' in s_b or 'print' in s_b }}
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Acoustic anomaly during print"
+        message: >-
+          Anomaly score {{ states('sensor.printer_monitor_acoustic_anomaly_score') }};
+          band {{ states('sensor.printer_monitor_anomaly_band') }}.
+
+# ------------------------------------------------------------------
+# Convenience scripts (kept here as automations.yaml is more common).
+# Run from Developer Tools -> Services:  script.turn_on entity_id=script.printer_monitor_shaper_x
+# ------------------------------------------------------------------
+- id: printer_monitor_run_shaper_x
+  alias: "Printer Monitor: run shaper sweep X"
+  mode: single
+  trigger: []
+  action:
+    - service: esphome.printer_monitor_start_shaper_capture
+      data:
+        axis: "X"
+
+- id: printer_monitor_run_shaper_y
+  alias: "Printer Monitor: run shaper sweep Y"
+  mode: single
+  trigger: []
+  action:
+    - service: esphome.printer_monitor_start_shaper_capture
+      data:
+        axis: "Y"

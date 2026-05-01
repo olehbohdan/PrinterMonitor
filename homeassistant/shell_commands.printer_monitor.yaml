@@ -1,0 +1,14 @@
+# Append to /config/configuration.yaml under shell_command:
+# (or save as a separate file and !include it)
+#
+# Variable {{ json_path }} is templated by the automation that calls this.
+
+pm_apply_shaper: "python3 /config/www/python/pm_apply_shaper.py {{ json_path }} --moonraker http://klipperpi:7125"
+
+# Atomically write the PSD JSON to disk. {{ payload }} is supplied by the
+# automation and is JSON-formatted by Jinja's | to_json.
+pm_write_psd: >-
+  bash -c "cat > {{ json_path }} <<'__PSD_EOF__'
+  {{ payload }}
+  __PSD_EOF__
+  "

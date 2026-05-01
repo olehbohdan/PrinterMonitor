@@ -1,0 +1,708 @@
+# =============================================================================
+# Printer Monitor  –  ESP32-C3 custom PCB
+# =============================================================================
+# Monitors 2 Klipper/Moonraker printers via Home Assistant.
+# Features: OLED dashboard, WS2812 status LED, 2 buttons, BMI270 vibration.
+#
+# Pinout (from board_self_test.cpp):
+#   WS2812 LED   GPIO5
+#   SW1          GPIO2  (active-low, pull-up)
+#   SW2          GPIO8  (active-low, pull-up; boot-strap -> must be HIGH at boot)
+#   I2C SDA      GPIO1
+#   I2C SCL      GPIO0
+#   OLED         SSD1306 @ 0x3C on I2C
+#   BMI270 IMU   @ 0x68 on I2C (for vibration monitoring)
+# =============================================================================
+
+substitutions:
+  device_name: printer-monitor
+  friendly_name: "Printer Monitor"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: arduino
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ bmi270, sph0645, gps_uart ]
+
+logger:
+  level: INFO
+  baud_rate: 115200
+
+api:
+  encryption:
+    key: !secret api_key
+  services:
+    # HA-initiated path: arm BMI270 capture AND ask HA to forward a
+    # PM_SHAPER_SWEEP_<axis> macro to Moonraker. Used when the dashboard
+    # button or HA automation kicks things off.
+    - service: start_shaper_capture
+      variables:
+        axis: string
+      then:
+        - lambda: 'id(bmi).start_capture(axis);'
+        - homeassistant.event:
+            event: esphome.printer_monitor_request_sweep
+            data:
+              axis: !lambda 'return axis;'
+    # Klipper-initiated path: arm ONLY. The Klipper macro chirps the
+    # toolhead itself right after this returns, so we must not fire the
+    # request_sweep event (no callback from HA -> Moonraker required).
+    - service: arm_shaper_capture
+      variables:
+        axis: string
+      then:
+        - lambda: 'id(bmi).start_capture(axis);'
+    - service: abort_shaper_capture
+      then:
+        - lambda: 'id(bmi).abort_capture();'
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: "printermon"
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# -----------------------------------------------------------------------------
+# Reusable scripts
+# -----------------------------------------------------------------------------
+script:
+  # Fires three esphome.printer_monitor_psd_ready events - one per physical
+  # chip axis (sensor-X, sensor-Y, sensor-Z). HA's queued automation
+  # processes them sequentially so the user sees PM_PEAK / PM_SHAPER_FOUND
+  # for all three in the Klipper console, and can confirm which chip axis
+  # actually picked up the chirp on the requested printer axis.
+  - id: send_psd_event
+    then:
+      - repeat:
+          count: 3
+          then:
+            - homeassistant.event:
+                event: esphome.printer_monitor_psd_ready
+                data:
+                  axis: !lambda |-
+                    std::vector<float> f, p; std::string a;
+                    float fs=0, pk=0;
+                    int idx = (int) id(psd_event_idx);
+                    id(bmi).get_psd_axis(idx, &f, &p, &a, &fs, &pk);
+                    return a;
+                  fs: !lambda |-
+                    std::vector<float> f, p; std::string a;
+                    float fs=0, pk=0;
+                    int idx = (int) id(psd_event_idx);
+                    id(bmi).get_psd_axis(idx, &f, &p, &a, &fs, &pk);
+                    return to_string(fs);
+                  peak_hz: !lambda |-
+                    std::vector<float> f, p; std::string a;
+                    float fs=0, pk=0;
+                    int idx = (int) id(psd_event_idx);
+                    id(bmi).get_psd_axis(idx, &f, &p, &a, &fs, &pk);
+                    return to_string(pk);
+                  psd: !lambda |-
+                    std::vector<float> f, p; std::string a;
+                    float fs=0, pk=0;
+                    int idx = (int) id(psd_event_idx);
+                    if (!id(bmi).get_psd_axis(idx, &f, &p, &a, &fs, &pk)) return std::string("");
+                    std::string csv;
+                    char buf[24];
+                    csv.reserve(p.size() * 10);
+                    for (size_t i = 0; i < p.size(); i++) {
+                      snprintf(buf, sizeof(buf), "%.6g", p[i]);
+                      csv += buf;
+                      if (i + 1 < p.size()) csv += ",";
+                    }
+                    return csv;
+            - lambda: 'id(psd_event_idx) = (id(psd_event_idx) + 1) % 3;'
+            - delay: 200ms
+      - lambda: 'id(psd_event_idx) = 0;'
+
+# -----------------------------------------------------------------------------
+# Global state
+# -----------------------------------------------------------------------------
+# SW3 slide (GPIO2) selects which printer to show on OLED.
+# SW4 slide (GPIO8) silences alerts (downgrades error LED).
+# No mutable globals needed - state is derived from the slide switches
+# and from tracking complete-transition timestamps inside the interval
+# lambda (static locals).
+globals:
+  # Iterates 0..2 across the three homeassistant.event calls fired by
+  # the send_psd_event script (one per chip axis).
+  - id: psd_event_idx
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# -----------------------------------------------------------------------------
+# I2C bus
+# -----------------------------------------------------------------------------
+i2c:
+  sda: GPIO1
+  scl: GPIO0
+  frequency: 400kHz
+  scan: true
+  id: bus_a
+
+# -----------------------------------------------------------------------------
+# UART for ATGM332D GPS receiver (UART0). The ESP32-C3 has only two UARTs
+# but the ESPHome logger can share UART0 with this if we use a different
+# UART id; here we explicitly assign GPIO20/21 which the PCB routes to the
+# GPS module footprint.
+# -----------------------------------------------------------------------------
+uart:
+  - id: uart_gps
+    rx_pin: GPIO20
+    tx_pin: GPIO21
+    baud_rate: 9600
+    rx_buffer_size: 256
+
+# -----------------------------------------------------------------------------
+# Acoustic anomaly + dBA from SPH0645 I²S microphone
+# -----------------------------------------------------------------------------
+sph0645:
+  id: mic
+  bclk_pin: 10
+  ws_pin:   3
+  din_pin:  7
+  sample_rate: 16000
+  update_interval: 1s
+  dba:
+    name: "Sound Level"
+    id: sound_dba
+  rms:
+    name: "Sound RMS"
+    id: sound_rms
+    internal: true
+  anomaly_score:
+    name: "Acoustic Anomaly Score"
+    id: anomaly_score
+  anomaly_band:
+    name: "Anomaly Band"
+    id: anomaly_band
+
+# -----------------------------------------------------------------------------
+# GPS receiver
+# -----------------------------------------------------------------------------
+gps_uart:
+  id: gps
+  uart_id: uart_gps
+  latitude:    {name: "GPS Latitude",   id: gps_lat}
+  longitude:   {name: "GPS Longitude",  id: gps_lon}
+  altitude:    {name: "GPS Altitude",   id: gps_alt}
+  hdop:        {name: "GPS HDOP",       id: gps_hdop}
+  satellites:  {name: "GPS Satellites", id: gps_sats}
+  speed:       {name: "GPS Speed",      id: gps_speed, internal: true}
+  fix_status:  {name: "GPS Fix Status", id: gps_fix}
+  utc_time:    {name: "GPS UTC Time",   id: gps_utc, internal: true}
+
+# -----------------------------------------------------------------------------
+# WS2812 status LED (single pixel)
+# -----------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    name: "Status LED"
+    pin: GPIO5
+    num_leds: 1
+    rgb_order: GRB
+    chipset: WS2812
+    default_transition_length: 300ms
+    effects:
+      - pulse:
+          name: "pulse_slow"
+          transition_length: 1s
+          update_interval: 1s
+      - pulse:
+          name: "pulse_fast"
+          transition_length: 200ms
+          update_interval: 200ms
+      - addressable_rainbow:
+          name: "rainbow"
+
+# -----------------------------------------------------------------------------
+# Slide switches (SPDT, 10k pull-up). Both rest HIGH when pulled up;
+# moving the slider to GND drives the pin LOW. With inverted:true the
+# reported state is true when the slide is in the "active" position.
+# -----------------------------------------------------------------------------
+binary_sensor:
+  # SW3 - printer selector. state=false -> Printer A, state=true -> Printer B.
+  - platform: gpio
+    id: sw_printer_select
+    name: "Printer Select (SW3)"
+    pin:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: 30ms
+    on_state:
+      - homeassistant.event:
+          event: esphome.printer_monitor_select
+          data:
+            printer: !lambda 'return x ? "A1" : "Ender";'
+      - display.page.show: !lambda 'return x ? id(page_b) : id(page_a);'
+      - component.update: oled
+
+  # SW4 - silence alerts slide. state=true when slid to the "silent" position.
+  - platform: gpio
+    id: sw_silence
+    name: "Silence Alerts (SW4)"
+    pin:
+      number: GPIO8
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: 30ms
+    on_state:
+      - homeassistant.event:
+          event: esphome.printer_monitor_silence
+          data:
+            silenced: !lambda 'return x;'
+
+# -----------------------------------------------------------------------------
+# Pull printer data from Home Assistant
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: homeassistant
+    id: p_a_progress
+    entity_id: !secret printer_a_progress
+    unit_of_measurement: "%"
+  - platform: homeassistant
+    id: p_a_extruder
+    entity_id: !secret printer_a_extruder_temp
+    unit_of_measurement: "°C"
+  - platform: homeassistant
+    id: p_a_bed
+    entity_id: !secret printer_a_bed_temp
+    unit_of_measurement: "°C"
+
+  - platform: homeassistant
+    id: p_b_progress
+    entity_id: !secret printer_b_progress
+    unit_of_measurement: "%"
+  - platform: homeassistant
+    id: p_b_extruder
+    entity_id: !secret printer_b_extruder_temp
+    unit_of_measurement: "°C"
+  - platform: homeassistant
+    id: p_b_bed
+    entity_id: !secret printer_b_bed_temp
+    unit_of_measurement: "°C"
+
+  # BMI270 vibration (G RMS) - reported to HA
+  - platform: bmi270
+    address: 0x68
+    i2c_id: bus_a
+    id: bmi
+    update_interval: 500ms
+    vibration:
+      name: "Vibration RMS"
+      id: vibration_rms
+      unit_of_measurement: "g"
+      accuracy_decimals: 3
+    accel_x:
+      name: "Accel X"
+      id: accel_x
+    accel_y:
+      name: "Accel Y"
+      id: accel_y
+    accel_z:
+      name: "Accel Z"
+      id: accel_z
+    gyro_x:
+      name: "Gyro X"
+    gyro_y:
+      name: "Gyro Y"
+    gyro_z:
+      name: "Gyro Z"
+    peak_freq:
+      name: "Shaper Peak Frequency"
+      id: shaper_peak_hz
+    capture_progress:
+      name: "Shaper Capture Progress"
+      id: shaper_progress
+
+  # Uptime for system page
+  - platform: uptime
+    id: uptime_s
+    update_interval: 10s
+    internal: true
+
+  - platform: wifi_signal
+    id: rssi_db
+    update_interval: 15s
+    internal: true
+
+text_sensor:
+  - platform: homeassistant
+    id: p_a_state
+    entity_id: !secret printer_a_state
+  - platform: homeassistant
+    id: p_a_eta
+    entity_id: !secret printer_a_eta
+  - platform: homeassistant
+    id: p_b_state
+    entity_id: !secret printer_b_state
+  - platform: homeassistant
+    id: p_b_eta
+    entity_id: !secret printer_b_eta
+
+  - platform: template
+    name: "Selected Printer"
+    id: selected_printer
+    update_interval: 1s
+    lambda: |-
+      return id(sw_printer_select).state ? std::string("A1")
+                                         : std::string("Ender");
+
+  # ---- BMI270 shaper capture state mirror ----
+  - platform: bmi270
+    bmi270_id: bmi
+    capture_state:
+      name: "Shaper Capture State"
+      id: shaper_state
+      on_value:
+        # When analysis completes, ship the PSD to HA so a Python script
+        # there can run the shaper search and apply the result via
+        # Moonraker.
+        then:
+          - if:
+              condition:
+                lambda: 'return x == "done";'
+              then:
+                - script.execute: send_psd_event
+    capture_axis:
+      name: "Shaper Capture Axis"
+      id: shaper_axis_ts
+
+# -----------------------------------------------------------------------------
+# OLED display
+# -----------------------------------------------------------------------------
+font:
+  - file: "gfonts://Roboto"
+    id: font_sm
+    size: 10
+  - file: "gfonts://Roboto"
+    id: font_md
+    size: 14
+  - file: "gfonts://Roboto"
+    id: font_lg
+    size: 22
+  - file: "gfonts://Roboto"
+    id: font_icon
+    size: 12
+    glyphs: "°%/:.-*!?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 "
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 128x64"
+    address: 0x3C
+    i2c_id: bus_a
+    update_interval: 500ms
+    pages:
+      # ---------- Page 0: Dual printer overview ----------
+      - id: page_dual
+        lambda: |-
+          it.printf(0, 0, id(font_sm), "A %s",
+            id(p_a_state).has_state() ? id(p_a_state).state.c_str() : "?");
+          if (id(p_a_progress).has_state()) {
+            int pct = (int)id(p_a_progress).state;
+            it.printf(0, 12, id(font_sm), "%3d%%", pct);
+            it.rectangle(28, 13, 98, 8);
+            it.filled_rectangle(28, 13, (pct * 98) / 100, 8);
+          }
+          it.printf(0, 22, id(font_sm), "E:%.0f  B:%.0f",
+            id(p_a_extruder).state, id(p_a_bed).state);
+
+          it.line(0, 33, 128, 33);
+
+          it.printf(0, 35, id(font_sm), "B %s",
+            id(p_b_state).has_state() ? id(p_b_state).state.c_str() : "?");
+          if (id(p_b_progress).has_state()) {
+            int pct = (int)id(p_b_progress).state;
+            it.printf(0, 47, id(font_sm), "%3d%%", pct);
+            it.rectangle(28, 48, 98, 8);
+            it.filled_rectangle(28, 48, (pct * 98) / 100, 8);
+          }
+          it.printf(0, 55, id(font_sm), "E:%.0f  B:%.0f",
+            id(p_b_extruder).state, id(p_b_bed).state);
+
+      # ---------- Page 1: Printer A full ----------
+      - id: page_a
+        lambda: |-
+          it.printf(0, 0, id(font_md), "Ender");
+          it.printf(0, 16, id(font_sm), "%s",
+            id(p_a_state).has_state() ? id(p_a_state).state.c_str() : "--");
+          if (id(p_a_progress).has_state()) {
+            int pct = (int)id(p_a_progress).state;
+            it.printf(0, 28, id(font_lg), "%d%%", pct);
+            it.rectangle(0, 52, 128, 10);
+            it.filled_rectangle(0, 52, (pct * 128) / 100, 10);
+          }
+          it.printf(127, 0, id(font_sm), display::TextAlign::TOP_RIGHT,
+            "E%.0f B%.0f", id(p_a_extruder).state, id(p_a_bed).state);
+          if (id(p_a_eta).has_state())
+            it.printf(0, 42, id(font_sm), "ETA %s", id(p_a_eta).state.c_str());
+
+      # ---------- Page 2: Printer B full ----------
+      - id: page_b
+        lambda: |-
+          it.printf(0, 0, id(font_md), "A1");
+          it.printf(0, 16, id(font_sm), "%s",
+            id(p_b_state).has_state() ? id(p_b_state).state.c_str() : "--");
+          if (id(p_b_progress).has_state()) {
+            int pct = (int)id(p_b_progress).state;
+            it.printf(0, 28, id(font_lg), "%d%%", pct);
+            it.rectangle(0, 52, 128, 10);
+            it.filled_rectangle(0, 52, (pct * 128) / 100, 10);
+          }
+          it.printf(127, 0, id(font_sm), display::TextAlign::TOP_RIGHT,
+            "E%.0f B%.0f", id(p_b_extruder).state, id(p_b_bed).state);
+          if (id(p_b_eta).has_state())
+            it.printf(0, 42, id(font_sm), "ETA %s", id(p_b_eta).state.c_str());
+
+      # ---------- Page 3: System ----------
+      - id: page_sys
+        lambda: |-
+          it.printf(0, 0, id(font_md), "System");
+          it.printf(0, 18, id(font_sm), "Uptime %.0fm",
+            id(uptime_s).has_state() ? id(uptime_s).state / 60.0f : 0.0f);
+          it.printf(0, 30, id(font_sm), "WiFi %.0f dBm",
+            id(rssi_db).has_state() ? id(rssi_db).state : 0.0f);
+          it.printf(0, 42, id(font_sm), "Vib %.3f g",
+            id(vibration_rms).has_state() ? id(vibration_rms).state : 0.0f);
+          it.printf(0, 54, id(font_sm), "Sel: %s  Silent: %s",
+            id(sw_printer_select).state ? "A1" : "Ender",
+            id(sw_silence).state ? "Y" : "N");
+
+      # ---------- Page 4: Clock ----------
+      - id: page_clock
+        lambda: |-
+          auto t = id(ha_time).now();
+          if (t.is_valid()) {
+            char buf[8];
+            t.strftime(buf, sizeof(buf), "%H:%M");
+            it.printf(64, 6, id(font_lg), display::TextAlign::TOP_CENTER, "%s", buf);
+            t.strftime(buf, sizeof(buf), "%a %d");
+            it.printf(64, 42, id(font_sm), display::TextAlign::TOP_CENTER, "%s", buf);
+          } else {
+            it.printf(64, 28, id(font_md), display::TextAlign::CENTER, "no time");
+          }
+
+      # ---------- Page 5: Shaper capture ----------
+      - id: page_shaper
+        lambda: |-
+          it.printf(0, 0, id(font_md), "Shaper");
+          it.printf(0, 18, id(font_sm), "State: %s",
+            id(shaper_state).has_state() ? id(shaper_state).state.c_str() : "idle");
+          it.printf(0, 30, id(font_sm), "Axis:  %s",
+            id(shaper_axis_ts).has_state() ? id(shaper_axis_ts).state.c_str() : "-");
+          if (id(shaper_progress).has_state()) {
+            int pct = (int) id(shaper_progress).state;
+            it.printf(0, 42, id(font_sm), "Cap:  %d%%", pct);
+            it.rectangle(50, 43, 76, 8);
+            it.filled_rectangle(50, 43, (pct * 76) / 100, 8);
+          }
+          if (id(shaper_peak_hz).has_state())
+            it.printf(0, 54, id(font_sm), "Peak: %.1f Hz", id(shaper_peak_hz).state);
+
+      # ---------- Page 6: Acoustic anomaly ----------
+      - id: page_anomaly
+        lambda: |-
+          it.printf(0, 0, id(font_md), "Sound");
+          if (id(sound_dba).has_state())
+            it.printf(0, 18, id(font_sm), "Level: %.0f dBA", id(sound_dba).state);
+          if (id(anomaly_score).has_state()) {
+            float z = id(anomaly_score).state;
+            it.printf(0, 30, id(font_sm), "Anomaly: %.2f", z);
+            // visual bar: 0..6 sigma
+            int w = (int) (z * 16);
+            if (w < 0) w = 0;
+            if (w > 96) w = 96;
+            it.rectangle(0, 44, 96, 10);
+            it.filled_rectangle(0, 44, w, 10);
+            if (z > 4.0f)
+              it.printf(0, 54, id(font_sm), "ABNORMAL");
+          }
+
+      # ---------- Page 7: GPS ----------
+      - id: page_gps
+        lambda: |-
+          it.printf(0, 0, id(font_md), "GPS");
+          it.printf(0, 18, id(font_sm), "Fix: %s",
+            id(gps_fix).has_state() ? id(gps_fix).state.c_str() : "-");
+          if (id(gps_sats).has_state())
+            it.printf(72, 18, id(font_sm), "Sat:%d", (int) id(gps_sats).state);
+          if (id(gps_lat).has_state())
+            it.printf(0, 30, id(font_sm), "%.5f N", id(gps_lat).state);
+          if (id(gps_lon).has_state())
+            it.printf(0, 42, id(font_sm), "%.5f E", id(gps_lon).state);
+          if (id(gps_hdop).has_state())
+            it.printf(0, 54, id(font_sm), "HDOP %.1f", id(gps_hdop).state);
+
+# -----------------------------------------------------------------------------
+# Page <-> mode sync + LED state machine
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 300ms
+    then:
+      - lambda: |-
+          // ---------- Display: SW3 picks which printer to show ----------
+          static bool last_sel = !id(sw_printer_select).state;
+          bool sel_b = id(sw_printer_select).state;
+          if (sel_b != last_sel) {
+            id(oled).show_page(sel_b ? id(page_b) : id(page_a));
+            last_sel = sel_b;
+          }
+
+          // ---------- LED state machine ----------
+          // Color scheme:
+          //   purple       -> idle
+          //   light blue   -> any printer printing
+          //   green        -> a print completed within the last 5 minutes
+          //   red          -> any printer in error (unless SW4 silenced)
+          //   amber        -> any printer paused
+          auto classify = [](const std::string &s) -> int {
+            // 0 idle, 1 printing, 2 paused, 3 complete, 4 error
+            // Klipper:  standby|printing|paused|complete|cancelled|error
+            // Bambu A1: idle|prepare|slicing|running|pause|finish|failed|offline|init|unknown
+            if (s.empty()) return 0;
+            if (s.find("error")  != std::string::npos ||
+                s.find("cancel") != std::string::npos ||
+                s.find("fail")   != std::string::npos) return 4;
+            if (s.find("paus")     != std::string::npos) return 2;
+            if (s.find("complete") != std::string::npos ||
+                s.find("finish")   != std::string::npos) return 3;
+            if (s.find("print")    != std::string::npos ||
+                s.find("running")  != std::string::npos ||
+                s.find("prepare")  != std::string::npos ||
+                s.find("slicing")  != std::string::npos) return 1;
+            return 0;
+          };
+          int a = id(p_a_state).has_state() ? classify(id(p_a_state).state) : -1;
+          int b = id(p_b_state).has_state() ? classify(id(p_b_state).state) : -1;
+
+          // Track transitions into "complete" so we can hold green for 5 min.
+          // prev_* stays at -1 until we've seen at least one real HA state,
+          // so a boot-time "unknown -> finish" sync doesn't fire the window.
+          static int prev_a = -1, prev_b = -1;
+          static uint32_t complete_a_ms = 0, complete_b_ms = 0;
+          const uint32_t now_ms = millis();
+          if (a >= 0) {
+            if (prev_a >= 0 && prev_a != 3 && a == 3) complete_a_ms = now_ms;
+            prev_a = a;
+          }
+          if (b >= 0) {
+            if (prev_b >= 0 && prev_b != 3 && b == 3) complete_b_ms = now_ms;
+            prev_b = b;
+          }
+          // Fall back to idle for downstream logic when state is unknown.
+          if (a < 0) a = 0;
+          if (b < 0) b = 0;
+          const uint32_t WINDOW = 5UL * 60UL * 1000UL;  // 5 minutes
+
+          // SW3 picks which printer drives the LED.
+          const bool silenced = id(sw_silence).state;
+          const int  sel_state = sel_b ? b : a;
+          const uint32_t sel_complete_ms = sel_b ? complete_b_ms : complete_a_ms;
+          const bool recent_complete =
+              sel_complete_ms && (now_ms - sel_complete_ms) < WINDOW;
+
+          const bool is_error    = (sel_state == 4) && !silenced;
+          const bool is_paused   = (sel_state == 2);
+          const bool is_printing = (sel_state == 1);
+
+          // 0 idle, 1 print, 2 pause, 3 recent-complete, 4 error
+          int led_state;
+          if (is_error)             led_state = 4;
+          else if (is_paused)       led_state = 2;
+          else if (is_printing)     led_state = 1;
+          else if (recent_complete) led_state = 3;
+          else                      led_state = 0;
+
+          // Only push an LED call when the target state actually changes, or
+          // every 10 s as a refresh heartbeat. Force an update immediately
+          // after a switch flip so the LED tracks the newly-selected printer.
+          static int last_led_state = -1;
+          static bool last_led_sel = sel_b;
+          static uint32_t last_led_ms = 0;
+          const bool sel_changed = (sel_b != last_led_sel);
+          if (!sel_changed && led_state == last_led_state &&
+              (now_ms - last_led_ms) < 10000) return;
+          last_led_state = led_state;
+          last_led_sel = sel_b;
+          last_led_ms = now_ms;
+
+          auto call = id(status_led).turn_on();
+          call.set_transition_length(400);
+          switch (led_state) {
+            case 4:  // red, fast pulse - error
+              call.set_rgb(1.0f, 0.0f, 0.0f);
+              call.set_brightness(0.85f);
+              call.set_effect("pulse_fast");
+              break;
+            case 2:  // amber, slow pulse - paused
+              call.set_rgb(1.0f, 0.55f, 0.0f);
+              call.set_brightness(0.4f);
+              call.set_effect("pulse_slow");
+              break;
+            case 1:  // light blue, steady - printing
+              call.set_rgb(0.25f, 0.75f, 1.0f);
+              call.set_brightness(0.35f);
+              call.set_effect("None");
+              break;
+            case 3:  // green, slow pulse - recent complete
+              call.set_rgb(0.0f, 1.0f, 0.15f);
+              call.set_brightness(0.5f);
+              call.set_effect("pulse_slow");
+              break;
+            default: // purple, dim slow pulse - idle
+              call.set_rgb(0.55f, 0.0f, 0.8f);
+              call.set_brightness(0.2f);
+              call.set_effect("pulse_slow");
+              break;
+          }
+          call.perform();
+
+  # Heartbeat: log the latest cached HA state every 10 s. ESPHome's
+  # homeassistant sensors are push-subscribed, so values are already live -
+  # this just surfaces them for debugging / sanity-checking.
+  - interval: 10s
+    then:
+      - lambda: |-
+          ESP_LOGI("poll", "Ender state='%s' prog=%.0f%%  |  A1 state='%s' prog=%.0f%%",
+            id(p_a_state).has_state() ? id(p_a_state).state.c_str() : "?",
+            id(p_a_progress).has_state() ? id(p_a_progress).state : 0.0f,
+            id(p_b_state).has_state() ? id(p_b_state).state.c_str() : "?",
+            id(p_b_progress).has_state() ? id(p_b_progress).state : 0.0f);
+
+# -----------------------------------------------------------------------------
+# Automations: fire HA events so you can trigger automations from HA
+# -----------------------------------------------------------------------------
+# Example: "turn on exhaust fan when any printer is printing" lives in HA,
+# triggered by sensor.printer_monitor_status or the events below.

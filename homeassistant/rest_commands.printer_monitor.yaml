@@ -1,0 +1,10 @@
+# Append to /config/configuration.yaml under rest_command:
+#
+# This proxies a Klipper macro call into Moonraker's /printer/gcode/script
+# endpoint. Adjust the URL to match your Klipper host.
+
+moonraker_run_macro:
+  url: "http://klipperpi:7125/printer/gcode/script"
+  method: POST
+  content_type: "application/json"
+  payload: '{"script":"{{ macro }}"}'
