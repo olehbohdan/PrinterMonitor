@@ -26,3 +26,4 @@ __pycache__/
 *.MOV
 *.mp4
 .github/
+.vscode/
