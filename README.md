@@ -55,8 +55,8 @@ PrinterMonitor/
 ├── test/
 │   ├── sketches/                  ← board_self_test.cpp, rainbow.cpp, input_shaper_capture.cpp
 │   └── python/                    ← shaper_calibrate.py port + analysis tools
-├── platformio.ini                 ← 3 envs: rainbow, selftest, shaper
-└── Netlist_INClassFirstPCB_2026-04-18.enet  ← EasyEDA Pro netlist
+├── board/                         ← PCB artifacts: schematic PDF, BOM, STEP, enclosure STLs, netlist
+└── platformio.ini                 ← 3 envs: rainbow, selftest, shaper
 ```
 
 ---
@@ -122,7 +122,7 @@ Three independent data flows coexist on the same MCU:
 | | USB-C plug + cable | Power + data | 1 | 1.50 |
 | | | **Total** | | **≈ 26.35** |
 
-The original EasyEDA Pro netlist is preserved at [`Netlist_INClassFirstPCB_2026-04-18.enet`](Netlist_INClassFirstPCB_2026-04-18.enet).
+Schematic PDF, BOM spreadsheet, STEP model, printable enclosure STLs, and the original EasyEDA Pro netlist are all in [`board/`](board/).
 
 ---
 
